@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from benchmark import run_benchmark
+from voicebridge.benchmark import run_benchmark
 from dialogs import (
     ModelEditDialog,
 )
