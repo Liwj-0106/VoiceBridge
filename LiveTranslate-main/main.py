@@ -15,7 +15,7 @@ import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-from model_manager import (
+from voicebridge.model_manager import (
     apply_cache_env,
     get_missing_models,
     is_asr_cached,
