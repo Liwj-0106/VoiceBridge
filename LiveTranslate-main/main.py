@@ -40,16 +40,16 @@ from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMess
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QPixmap, QPainter, QColor, QFont
 from PyQt6.QtCore import QTimer, Qt
 
-from subtitle_overlay import SubtitleOverlay
-from subtitle_window import SubtitleWindow
-from log_window import LogWindow
-from control_panel import (
+from voicebridge.ui.overlay import SubtitleOverlay
+from voicebridge.ui.subtitle import SubtitleWindow
+from voicebridge.ui.log_window import LogWindow
+from voicebridge.ui.control_panel import (
     ControlPanel,
     SETTINGS_FILE,
     _load_saved_settings,
     _save_settings,
 )
-from dialogs import (
+from voicebridge.ui.dialogs import (
     SetupWizardDialog,
     ModelDownloadDialog,
     _ModelLoadDialog,
@@ -341,7 +341,7 @@ class LiveTranslateApp:
         if self._panel:
             settings = self._panel.get_settings()
             settings["target_language"] = lang
-            from control_panel import _save_settings
+            from voicebridge.ui.control_panel import _save_settings
             _save_settings(settings)
 
     def _on_model_changed(self, model_config: dict):
@@ -1347,7 +1347,7 @@ def main():
         log.info("Setup wizard completed")
 
         # 提示用户配置翻译API
-        from dialogs import ModelEditDialog
+        from voicebridge.ui.dialogs import ModelEditDialog
 
         info = QMessageBox(
             QMessageBox.Icon.Information,
@@ -1705,7 +1705,7 @@ def main():
         """托盘菜单切换翻译模型"""
         models = panel.get_settings().get("models", [])
         if 0 <= index < len(models):
-            from control_panel import _save_settings
+            from voicebridge.ui.control_panel import _save_settings
 
             settings = panel.get_settings()
             settings["active_model"] = index
@@ -1718,7 +1718,7 @@ def main():
     def on_overlay_model_switch(index):
         models = panel.get_settings().get("models", [])
         if 0 <= index < len(models):
-            from control_panel import _save_settings
+            from voicebridge.ui.control_panel import _save_settings
 
             settings = panel.get_settings()
             settings["active_model"] = index
@@ -1762,7 +1762,7 @@ def main():
         """托盘菜单切换目标语言"""
         overlay.set_target_language(lang_code)
         live_trans._on_target_language_changed(lang_code)
-        from control_panel import _save_settings
+        from voicebridge.ui.control_panel import _save_settings
 
         settings = panel.get_settings()
         settings["target_language"] = lang_code
@@ -1805,7 +1805,7 @@ def main():
 
     def _on_tray_asr_lang(code):
         """托盘菜单切换ASR语言"""
-        from control_panel import _save_settings
+        from voicebridge.ui.control_panel import _save_settings
 
         if live_trans._asr:
             live_trans._asr.set_language(code)
