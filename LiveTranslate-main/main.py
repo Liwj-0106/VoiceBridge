@@ -54,7 +54,7 @@ from dialogs import (
     ModelDownloadDialog,
     _ModelLoadDialog,
 )
-from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
+from voicebridge.i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
 
 
 def setup_logging():
