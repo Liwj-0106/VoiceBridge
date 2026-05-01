@@ -1203,6 +1203,42 @@ class LiveTranslateApp:
                 self._asr_queue.put(item)
                 break
 
+    def init_ui(self, config, saved):
+        """Create UI components: LogWindow, ControlPanel, Overlay, SubtitleWindow."""
+        self._log_window = LogWindow()
+        log_handler = self._log_window.get_handler()
+        logging.getLogger().addHandler(log_handler)
+
+        self._panel = ControlPanel(config, saved_settings=saved)
+
+        self._overlay = SubtitleOverlay(config["subtitle"])
+        if saved:
+            ox = saved.get("overlay_x")
+            oy = saved.get("overlay_y")
+            ow = saved.get("overlay_w")
+            oh = saved.get("overlay_h")
+            if ox is not None and oy is not None:
+                if SubtitleWindow._is_pos_visible(ox, oy):
+                    self._overlay.move(ox, oy)
+                else:
+                    screen = QApplication.primaryScreen()
+                    geo = screen.availableGeometry()
+                    self._overlay.move(
+                        geo.right() - self._overlay.width() - 20,
+                        geo.bottom() - self._overlay.height() - 60,
+                    )
+            if ow and oh:
+                self._overlay.resize(ow, oh)
+        self._overlay.show()
+
+        subwin_cfg = (saved or {}).get("subtitle_mode")
+        self._subwin = SubtitleWindow(subwin_cfg)
+        self._subwin_was_enabled = (subwin_cfg or {}).get("enabled", False)
+
+        self.set_overlay(self._overlay)
+        self.set_subtitle_window(self._subwin)
+        self.set_panel(self._panel)
+
 
 def main():
     """
