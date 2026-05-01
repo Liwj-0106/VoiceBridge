@@ -33,7 +33,7 @@ import torch  # noqa: F401
 
 from voicebridge.audio.capture import AudioCapture
 from voicebridge.vad.processor import VADProcessor
-from asr_engine import ASREngine
+from voicebridge.asr.whisper import ASREngine
 from voicebridge.translation.translator import Translator, RepetitionError
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
@@ -462,17 +462,17 @@ class LiveTranslateApp:
                     dev = "cuda"
 
                 if engine_type == "sensevoice":
-                    from asr_sensevoice import SenseVoiceEngine
+                    from voicebridge.asr.sensevoice import SenseVoiceEngine
 
                     new_asr[0] = SenseVoiceEngine(device=device, hub=hub)
                 elif engine_type in ("funasr-nano", "funasr-mlt-nano"):
-                    from asr_funasr_nano import FunASRNanoEngine
+                    from voicebridge.asr.funasr_nano import FunASRNanoEngine
 
                     new_asr[0] = FunASRNanoEngine(
                         device=device, hub=hub, engine_type=engine_type
                     )
                 elif engine_type == "anime-whisper":
-                    from asr_anime_whisper import AnimeWhisperEngine
+                    from voicebridge.asr.anime_whisper import AnimeWhisperEngine
 
                     dev_str = dev if dev == "cpu" else f"cuda:{dev_index}"
                     new_asr[0] = AnimeWhisperEngine(device=dev_str, hub=hub)
