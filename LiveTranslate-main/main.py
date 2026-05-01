@@ -34,7 +34,7 @@ import torch  # noqa: F401
 from voicebridge.audio.capture import AudioCapture
 from voicebridge.vad.processor import VADProcessor
 from asr_engine import ASREngine
-from translator import Translator, RepetitionError
+from voicebridge.translation.translator import Translator, RepetitionError
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
 from PyQt6.QtGui import QAction, QActionGroup, QIcon, QPixmap, QPainter, QColor, QFont
