@@ -256,7 +256,7 @@ class SetupWizardDialog(QDialog):
 
         self._append_log(f"\n{t('download_complete')}")
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
-        from control_panel import _save_settings
+        from voicebridge.ui.control_panel import _save_settings
 
         settings = {
             "hub": hub,

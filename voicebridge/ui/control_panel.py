@@ -29,17 +29,17 @@ from PyQt6.QtWidgets import (
 )
 
 from voicebridge.benchmark import run_benchmark
-from dialogs import (
+from voicebridge.ui.dialogs import (
     ModelEditDialog,
 )
-from model_manager import (
+from voicebridge.model_manager import (
     MODELS_DIR,
     dir_size,
     format_size,
     get_cache_entries,
 )
 from voicebridge.i18n import t, LANGUAGES
-from subtitle_settings import SubtitleSettingsWidget
+from voicebridge.ui.subtitle_settings import SubtitleSettingsWidget
 
 log = logging.getLogger("LiveTranslate.Panel")
 
@@ -226,7 +226,7 @@ class ControlPanel(QWidget):
         self._audio_device.addItem(t("audio_disabled"))
         self._audio_device.addItem(t("system_default"))
         try:
-            from audio_capture import list_output_devices
+            from voicebridge.audio.capture import list_output_devices
 
             for name in list_output_devices():
                 self._audio_device.addItem(name)
@@ -249,7 +249,7 @@ class ControlPanel(QWidget):
         self._mic_device.addItem(t("mic_disabled"))
         self._mic_device.addItem(t("system_default"))
         try:
-            from audio_capture import list_input_devices
+            from voicebridge.audio.capture import list_input_devices
 
             for name in list_input_devices():
                 self._mic_device.addItem(name)
@@ -463,7 +463,7 @@ class ControlPanel(QWidget):
         prompt_group = QGroupBox(t("group_system_prompt"))
         prompt_layout = QVBoxLayout(prompt_group)
 
-        from translator import DEFAULT_PROMPT, PROMPT_PRESETS
+        from voicebridge.translation.translator import DEFAULT_PROMPT, PROMPT_PRESETS
 
         # Preset selector
         preset_row = QHBoxLayout()
@@ -522,7 +522,7 @@ class ControlPanel(QWidget):
     # ── Style Tab ──
 
     def _create_style_tab(self):
-        from subtitle_overlay import DEFAULT_STYLE
+        from voicebridge.ui.overlay import DEFAULT_STYLE
 
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -788,7 +788,7 @@ class ControlPanel(QWidget):
         self._window_opacity.setValue(s["window_opacity"])
 
     def _on_preset_changed(self, index):
-        from subtitle_overlay import STYLE_PRESETS
+        from voicebridge.ui.overlay import STYLE_PRESETS
 
         key = self._preset_keys[index]
         if key == "custom":
@@ -811,7 +811,7 @@ class ControlPanel(QWidget):
         self._auto_save()
 
     def _reset_style(self):
-        from subtitle_overlay import DEFAULT_STYLE
+        from voicebridge.ui.overlay import DEFAULT_STYLE
 
         self._style_preset.blockSignals(True)
         self._style_preset.setCurrentIndex(0)  # default
@@ -886,7 +886,7 @@ class ControlPanel(QWidget):
     # ── Cache Tab ──
 
     def _create_changelog_tab(self):
-        from dialogs import _load_latest_changelog
+        from voicebridge.ui.dialogs import _load_latest_changelog
         widget = QWidget()
         layout = QVBoxLayout(widget)
         _, html = _load_latest_changelog()
@@ -999,7 +999,7 @@ class ControlPanel(QWidget):
         QTimer.singleShot(0, _fit)
 
     def _update_whisper_size_label(self):
-        from model_manager import is_asr_cached, _MODEL_SIZE_BYTES
+        from voicebridge.model_manager import is_asr_cached, _MODEL_SIZE_BYTES
 
         size = self._whisper_size_combo.currentText()
         cached = is_asr_cached("whisper", size, self._current_settings.get("hub", "ms"))
@@ -1019,14 +1019,14 @@ class ControlPanel(QWidget):
         )
         self._update_whisper_size_label()
         # If already cached, switch engine immediately
-        from model_manager import is_asr_cached
+        from voicebridge.model_manager import is_asr_cached
 
         size = self._whisper_size_combo.currentText()
         if is_asr_cached("whisper", size, self._current_settings.get("hub", "ms")):
             self._auto_save()
 
     def _download_whisper(self):
-        from model_manager import is_asr_cached, get_missing_models
+        from voicebridge.model_manager import is_asr_cached, get_missing_models
 
         size = self._whisper_size_combo.currentText()
         hub = self._current_settings.get("hub", "ms")
@@ -1036,7 +1036,7 @@ class ControlPanel(QWidget):
         missing = [m for m in missing if m["type"] != "silero-vad"]
         if not missing:
             return
-        from dialogs import ModelDownloadDialog
+        from voicebridge.ui.dialogs import ModelDownloadDialog
 
         dlg = ModelDownloadDialog(missing, hub=hub, parent=self)
         if dlg.exec() == dlg.DialogCode.Accepted:
@@ -1142,7 +1142,7 @@ class ControlPanel(QWidget):
         self._bench_btn.setText(t("testing"))
         self._bench_output.clear()
 
-        from translator import DEFAULT_PROMPT, LANGUAGE_DISPLAY
+        from voicebridge.translation.translator import DEFAULT_PROMPT, LANGUAGE_DISPLAY
 
         src = LANGUAGE_DISPLAY.get(source_lang, source_lang)
         tgt = LANGUAGE_DISPLAY.get(target_lang, target_lang)
@@ -1220,7 +1220,7 @@ class ControlPanel(QWidget):
         _save_settings(self._current_settings)
 
     def _on_prompt_preset_changed(self, index):
-        from translator import DEFAULT_PROMPT, PROMPT_PRESETS
+        from voicebridge.translation.translator import DEFAULT_PROMPT, PROMPT_PRESETS
         key = self._prompt_preset.itemData(index)
         if key == "custom":
             return
@@ -1238,7 +1238,7 @@ class ControlPanel(QWidget):
             _save_settings(self._current_settings)
             log.info("System prompt updated")
             # Update preset combo to reflect current state
-            from translator import PROMPT_PRESETS
+            from voicebridge.translation.translator import PROMPT_PRESETS
             self._prompt_preset.blockSignals(True)
             matched = 3  # custom
             for i, key in enumerate(["daily", "esports", "anime"]):

@@ -55,97 +55,9 @@ from voicebridge.ui.dialogs import (
     _ModelLoadDialog,
 )
 from voicebridge.i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
-
-
-def setup_logging():
-    """
-    配置日志系统：
-    1. 同时输出到文件（DEBUG级别）和控制台（INFO级别）
-    2. 屏蔽第三方库的冗余日志
-    3. 设置全局异常钩子，捕获所有未处理异常
-    """
-    log_dir = Path(__file__).parent / "logs"
-    log_dir.mkdir(exist_ok=True)
-    # 日志文件名包含时间戳，方便区分
-    log_file = log_dir / f"livetrans_{datetime.now():%Y%m%d_%H%M%S}.log"
-
-    # 文件Handler：记录DEBUG以上所有信息
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    # 控制台Handler：只显示INFO以上信息，减少噪音
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-    file_handler.setFormatter(fmt)
-    console_handler.setFormatter(fmt)
-
-    logging.basicConfig(level=logging.DEBUG, handlers=[file_handler, console_handler])
-
-    # 屏蔽第三方库的冗余日志输出
-    for noisy in (
-        "httpcore",
-        "httpx",
-        "openai",
-        "filelock",
-        "huggingface_hub",
-        "funasr",
-        "modelscope",
-        "onnxruntime",
-    ):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    logging.info(f"Log file: {log_file}")
-
-    # FunASR/ModelScope 会污染root logger，抑制一下
-    logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger("LiveTranslate").setLevel(logging.DEBUG)
-
-    _logger = logging.getLogger("LiveTranslate")
-
-    # 全局异常钩子：捕获主线程未处理的异常
-    def _excepthook(exc_type, exc_value, exc_tb):
-        _logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-    sys.excepthook = _excepthook
-
-    # 线程异常钩子：捕获所有后台线程的未处理异常
-    def _thread_excepthook(args):
-        _logger.critical(
-            f"Uncaught exception in thread {args.thread}",
-            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
-        )
-
-    threading.excepthook = _thread_excepthook
-
-    return _logger
-
+from voicebridge.bootstrap import setup_logging, create_app_icon, load_config
 
 log = logging.getLogger("LiveTranslate")
-
-
-def create_app_icon() -> QIcon:
-    """用代码生成应用图标（蓝色圆角矩形 + "LT" 文字），避免需要外部图标文件"""
-    pix = QPixmap(64, 64)
-    pix.fill(QColor(0, 0, 0, 0))
-    p = QPainter(pix)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setBrush(QColor(60, 130, 240))  # 蓝色背景
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawRoundedRect(4, 4, 56, 56, 12, 12)  # 圆角矩形
-    p.setPen(QColor(255, 255, 255))  # 白色文字
-    p.setFont(QFont("Consolas", 28, QFont.Weight.Bold))
-    p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "LT")
-    p.end()
-    return QIcon(pix)
-
-
-def load_config():
-    """加载 config.yaml 基础配置文件"""
-    config_path = Path(__file__).parent / "config.yaml"
-    with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
 
 
 class LiveTranslateApp:
@@ -162,6 +74,7 @@ class LiveTranslateApp:
         self._config = config
         self._running = False      # 管线是否运行
         self._paused = False       # 是否暂停
+        self._is_running = True    # 托盘菜单暂停/恢复状态
         self._asr_ready = False    # ASR模型是否加载完成
 
         # 音频捕获：WASAPI loopback，32ms分块
@@ -1291,6 +1204,452 @@ class LiveTranslateApp:
                 self._asr_queue.put(item)
                 break
 
+    def init_ui(self, config, saved):
+        """Create UI components: LogWindow, ControlPanel, Overlay, SubtitleWindow."""
+        self._log_window = LogWindow()
+        log_handler = self._log_window.get_handler()
+        logging.getLogger().addHandler(log_handler)
+
+        self._panel = ControlPanel(config, saved_settings=saved)
+
+        self._overlay = SubtitleOverlay(config["subtitle"])
+        if saved:
+            ox = saved.get("overlay_x")
+            oy = saved.get("overlay_y")
+            ow = saved.get("overlay_w")
+            oh = saved.get("overlay_h")
+            if ox is not None and oy is not None:
+                if SubtitleWindow._is_pos_visible(ox, oy):
+                    self._overlay.move(ox, oy)
+                else:
+                    screen = QApplication.primaryScreen()
+                    geo = screen.availableGeometry()
+                    self._overlay.move(
+                        geo.right() - self._overlay.width() - 20,
+                        geo.bottom() - self._overlay.height() - 60,
+                    )
+            if ow and oh:
+                self._overlay.resize(ow, oh)
+        self._overlay.show()
+
+        subwin_cfg = (saved or {}).get("subtitle_mode")
+        self._subwin = SubtitleWindow(subwin_cfg)
+        self._subwin_was_enabled = (subwin_cfg or {}).get("enabled", False)
+
+        self.set_overlay(self._overlay)
+        self.set_subtitle_window(self._subwin)
+        self.set_panel(self._panel)
+
+    def init_tray(self, app_icon, app):
+        """Create system tray icon, menu, and wire all overlay/panel signals."""
+        overlay = self._overlay
+        panel = self._panel
+        subwin = self._subwin
+        log_window = self._log_window
+
+        # --- Deferred initialization ---
+        def _deferred_init():
+            panel._apply_settings()
+            models = panel.get_settings().get("models", [])
+            active_idx = panel.get_settings().get("active_model", 0)
+            overlay.set_models(models, active_idx)
+            target = panel.get_settings().get("target_language", "zh")
+            overlay.set_target_language(target)
+            asr_lang = panel.get_settings().get("asr_language", "auto")
+            overlay.set_source_language(asr_lang)
+            style = panel.get_settings().get("style")
+            if style:
+                overlay.apply_style(style)
+            active_model = panel.get_active_model()
+            if active_model:
+                self._on_model_changed(active_model)
+
+        QTimer.singleShot(100, _deferred_init)
+
+        # --- System tray ---
+        tray = QSystemTrayIcon()
+        tray.setToolTip(t("tray_tooltip"))
+        tray.setIcon(app_icon)
+        self._tray = tray
+
+        menu = QMenu()
+
+        # Pause/Resume
+        pause_action = QAction(t("tray_pause"))
+
+        def on_start():
+            try:
+                self.start()
+                overlay.set_running(True)
+                self._is_running = True
+                pause_action.setText(t("tray_pause"))
+            except Exception as e:
+                log.error(f"Start error: {e}", exc_info=True)
+
+        def on_pause():
+            self.pause()
+            overlay.set_running(False)
+            self._is_running = False
+            pause_action.setText(t("tray_resume"))
+
+        def on_resume():
+            self.resume()
+            overlay.set_running(True)
+            self._is_running = True
+            pause_action.setText(t("tray_pause"))
+
+        def on_toggle_pause():
+            if self._is_running:
+                on_pause()
+            else:
+                on_resume()
+
+        pause_action.triggered.connect(on_toggle_pause)
+        menu.addAction(pause_action)
+        menu.addSeparator()
+
+        # Overlay show/hide
+        overlay_toggle_action = QAction(t("tray_hide_overlay"))
+        _hide_notified = [False]
+
+        def on_toggle_overlay():
+            if overlay.isVisible():
+                overlay.hide()
+                overlay_toggle_action.setText(t("tray_show_overlay"))
+                if not _hide_notified[0]:
+                    _hide_notified[0] = True
+                    tray.showMessage(
+                        "LiveTranslate",
+                        t("hide_tray_hint"),
+                        QSystemTrayIcon.MessageIcon.Information,
+                        3000,
+                    )
+            else:
+                overlay.show()
+                overlay.raise_()
+                overlay_toggle_action.setText(t("tray_hide_overlay"))
+
+        overlay_toggle_action.triggered.connect(on_toggle_overlay)
+        menu.addAction(overlay_toggle_action)
+
+        # Save overlay position
+        def _save_overlay_pos():
+            settings = panel.get_settings()
+            pos = overlay.pos()
+            size = overlay.size()
+            settings["overlay_x"] = pos.x()
+            settings["overlay_y"] = pos.y()
+            settings["overlay_w"] = size.width()
+            settings["overlay_h"] = size.height()
+            panel._current_settings.update({
+                "overlay_x": pos.x(), "overlay_y": pos.y(),
+                "overlay_w": size.width(), "overlay_h": size.height(),
+            })
+            _save_settings(settings)
+
+        overlay.position_changed.connect(_save_overlay_pos)
+
+        # OBS subtitle window toggle
+        subwin_toggle_action = QAction(t("subwin_show"), checkable=True)
+
+        def _save_subwin_state():
+            settings = panel.get_settings()
+            sm = settings.get("subtitle_mode") or {}
+            sm["enabled"] = subwin.isVisible()
+            pos = subwin.pos()
+            sm["window_x"] = pos.x()
+            sm["window_y"] = pos.y()
+            settings["subtitle_mode"] = sm
+            panel._current_settings["subtitle_mode"] = sm
+            _save_settings(settings)
+
+        _subwin_notified = [False]
+
+        def on_toggle_subwin(checked):
+            if checked:
+                subwin.show()
+                subwin.raise_()
+                if not _subwin_notified[0]:
+                    _subwin_notified[0] = True
+                    tray.showMessage(
+                        "LiveTranslate",
+                        t("subwin_drag_hint"),
+                        QSystemTrayIcon.MessageIcon.Information,
+                        3000,
+                    )
+            else:
+                subwin.hide()
+            overlay.set_subtitle_checked(checked)
+            _save_subwin_state()
+
+        subwin_toggle_action.toggled.connect(on_toggle_subwin)
+        subwin.position_changed.connect(_save_subwin_state)
+
+        def _on_subwin_closed():
+            subwin_toggle_action.blockSignals(True)
+            subwin_toggle_action.setChecked(False)
+            subwin_toggle_action.blockSignals(False)
+            overlay.set_subtitle_checked(False)
+            _save_subwin_state()
+
+        subwin.window_closed.connect(_on_subwin_closed)
+
+        if self._subwin_was_enabled:
+            subwin_toggle_action.setChecked(True)
+
+        menu.addAction(subwin_toggle_action)
+
+        # Overlay subtitle button → toggle subtitle window
+        def _on_overlay_subtitle_toggle():
+            subwin_toggle_action.setChecked(not subwin_toggle_action.isChecked())
+
+        overlay.subtitle_toggled.connect(_on_overlay_subtitle_toggle)
+
+        # Panel subtitle settings → apply to subtitle window
+        def _on_panel_subtitle_changed(s):
+            subwin.apply_settings(s)
+
+        panel.subtitle_settings_changed.connect(_on_panel_subtitle_changed)
+
+        # Reset all window positions
+        def _on_reset_positions():
+            screen = QApplication.primaryScreen()
+            geo = screen.availableGeometry()
+            subwin.move(100, 100)
+            _save_subwin_state()
+            ow, oh = overlay.width(), overlay.height()
+            overlay.move(geo.right() - ow - 50, geo.bottom() - oh - 100)
+            _save_overlay_pos()
+
+        panel.reset_positions.connect(_on_reset_positions)
+
+        menu.addSeparator()
+
+        # Log / Panel actions
+        log_action = QAction(t("tray_show_log"))
+        panel_action = QAction(t("tray_show_panel"))
+
+        def on_toggle_log():
+            if log_window.isVisible():
+                log_window.hide()
+            else:
+                log_window.show()
+                log_window.raise_()
+
+        def on_toggle_panel():
+            if panel.isVisible():
+                panel.hide()
+            else:
+                panel.show()
+                panel.raise_()
+
+        log_action.triggered.connect(on_toggle_log)
+        panel_action.triggered.connect(on_toggle_panel)
+        menu.addAction(panel_action)
+        menu.addAction(log_action)
+        menu.addSeparator()
+
+        # Overlay submenu (click-through, topmost, auto-scroll, taskbar)
+        overlay_menu = QMenu(t("tray_menu_overlay"))
+
+        ct_action = QAction(t("click_through"), checkable=True)
+        topmost_action = QAction(t("top_most"), checkable=True)
+        topmost_action.setChecked(True)
+        autoscroll_action = QAction(t("auto_scroll"), checkable=True)
+        autoscroll_action.setChecked(True)
+        taskbar_action = QAction(t("taskbar"), checkable=True)
+
+        ct_action.toggled.connect(lambda v: overlay._handle._ct_check.setChecked(v))
+        topmost_action.toggled.connect(
+            lambda v: overlay._handle._topmost_check.setChecked(v)
+        )
+        autoscroll_action.toggled.connect(
+            lambda v: overlay._handle._auto_scroll.setChecked(v)
+        )
+        taskbar_action.toggled.connect(
+            lambda v: overlay._handle._taskbar_check.setChecked(v)
+        )
+
+        overlay._handle.click_through_toggled.connect(lambda v: ct_action.setChecked(v))
+        overlay._handle.topmost_toggled.connect(lambda v: topmost_action.setChecked(v))
+        overlay._handle.auto_scroll_toggled.connect(
+            lambda v: autoscroll_action.setChecked(v)
+        )
+        overlay._handle.taskbar_toggled.connect(lambda v: taskbar_action.setChecked(v))
+
+        overlay_menu.addAction(ct_action)
+        overlay_menu.addAction(topmost_action)
+        overlay_menu.addAction(autoscroll_action)
+        overlay_menu.addAction(taskbar_action)
+        menu.addMenu(overlay_menu)
+
+        # Translation model submenu
+        model_menu = QMenu(t("tray_menu_model"))
+        model_action_group = QActionGroup(model_menu)
+        model_action_group.setExclusive(True)
+
+        def _rebuild_model_menu():
+            for a in model_action_group.actions():
+                model_action_group.removeAction(a)
+            model_menu.clear()
+            settings = panel.get_settings()
+            models = settings.get("models", [])
+            active = settings.get("active_model", 0)
+            for i, m in enumerate(models):
+                name = m.get("name", m.get("model", "?"))
+                action = QAction(name, checkable=True)
+                if i == active:
+                    action.setChecked(True)
+                model_action_group.addAction(action)
+                action.triggered.connect(lambda checked, idx=i: _on_tray_model_switch(idx))
+                model_menu.addAction(action)
+
+        def _on_tray_model_switch(index):
+            models = panel.get_settings().get("models", [])
+            if 0 <= index < len(models):
+                settings = panel.get_settings()
+                settings["active_model"] = index
+                panel._current_settings["active_model"] = index
+                _save_settings(settings)
+                panel._refresh_model_list()
+                self._on_model_changed(models[index])
+                overlay.set_models(models, index)
+
+        def on_overlay_model_switch(index):
+            models = panel.get_settings().get("models", [])
+            if 0 <= index < len(models):
+                settings = panel.get_settings()
+                settings["active_model"] = index
+                panel._current_settings["active_model"] = index
+                _save_settings(settings)
+                panel._refresh_model_list()
+                self._on_model_changed(models[index])
+            _rebuild_model_menu()
+
+        model_menu.aboutToShow.connect(_rebuild_model_menu)
+        menu.addMenu(model_menu)
+
+        # Target language submenu
+        lang_menu = QMenu(t("tray_menu_target_lang"))
+        lang_action_group = QActionGroup(lang_menu)
+        lang_action_group.setExclusive(True)
+        _lang_actions = {}
+        lang_more_menu = QMenu(t("tray_more_langs"))
+
+        for code, native in LANGUAGES:
+            if code == "auto":
+                continue
+            action = QAction(f"{code} - {native}", checkable=True)
+            lang_action_group.addAction(action)
+            action.triggered.connect(lambda checked, lc=code: _on_tray_lang_switch(lc))
+            if code in COMMON_LANG_CODES:
+                lang_menu.addAction(action)
+            else:
+                lang_more_menu.addAction(action)
+            _lang_actions[code] = action
+
+        lang_menu.addMenu(lang_more_menu)
+
+        current_target = panel.get_settings().get("target_language", "zh")
+        if current_target in _lang_actions:
+            _lang_actions[current_target].setChecked(True)
+
+        def _on_tray_lang_switch(lang_code):
+            overlay.set_target_language(lang_code)
+            self._on_target_language_changed(lang_code)
+            settings = panel.get_settings()
+            settings["target_language"] = lang_code
+            panel._current_settings["target_language"] = lang_code
+            _save_settings(settings)
+
+        def _on_overlay_lang_changed(lang_code):
+            if lang_code in _lang_actions:
+                _lang_actions[lang_code].setChecked(True)
+
+        overlay.target_language_changed.connect(_on_overlay_lang_changed)
+        menu.addMenu(lang_menu)
+
+        # ASR language submenu
+        asr_lang_menu = QMenu(t("tray_menu_asr_lang"))
+        asr_lang_action_group = QActionGroup(asr_lang_menu)
+        asr_lang_action_group.setExclusive(True)
+        _asr_lang_actions = {}
+        asr_more_menu = QMenu(t("tray_more_langs"))
+
+        for code, native in LANGUAGES:
+            label = t("asr_lang_auto") if code == "auto" else native
+            action = QAction(f"{code} - {label}", checkable=True)
+            asr_lang_action_group.addAction(action)
+            action.triggered.connect(lambda checked, c=code: _on_tray_asr_lang(c))
+            if code in COMMON_LANG_CODES:
+                asr_lang_menu.addAction(action)
+            else:
+                asr_more_menu.addAction(action)
+            _asr_lang_actions[code] = action
+
+        asr_lang_menu.addMenu(asr_more_menu)
+
+        current_asr_lang = panel.get_settings().get("asr_language", "auto")
+        if current_asr_lang in _asr_lang_actions:
+            _asr_lang_actions[current_asr_lang].setChecked(True)
+
+        def _on_tray_asr_lang(code):
+            if self._asr:
+                self._asr.set_language(code)
+            settings = panel.get_settings()
+            settings["asr_language"] = code
+            panel._current_settings["asr_language"] = code
+            _save_settings(settings)
+            idx = panel._asr_lang.findData(code)
+            if idx >= 0:
+                panel._asr_lang.blockSignals(True)
+                panel._asr_lang.setCurrentIndex(idx)
+                panel._asr_lang.blockSignals(False)
+
+        menu.addMenu(asr_lang_menu)
+        menu.addSeparator()
+
+        # Quit
+        quit_action = QAction(t("quit"))
+
+        def on_quit():
+            self.stop()
+            app.quit()
+
+        quit_action.triggered.connect(on_quit)
+        menu.addAction(quit_action)
+
+        # --- Wire overlay signals ---
+        overlay.settings_requested.connect(on_toggle_panel)
+        overlay.target_language_changed.connect(self._on_target_language_changed)
+
+        def _on_overlay_source_lang(code):
+            _on_tray_asr_lang(code)
+            overlay.set_source_language(code)
+
+        def _on_panel_asr_lang_changed(_index):
+            code = panel._asr_lang.currentData() or "auto"
+            overlay.set_source_language(code)
+
+        overlay.source_language_changed.connect(_on_overlay_source_lang)
+        panel._asr_lang.currentIndexChanged.connect(_on_panel_asr_lang_changed)
+        overlay.model_switch_requested.connect(on_overlay_model_switch)
+        overlay.start_requested.connect(on_resume)
+        overlay.stop_requested.connect(on_pause)
+        overlay.hide_requested.connect(on_toggle_overlay)
+        overlay.quit_requested.connect(on_quit)
+
+        # Show tray
+        tray.setContextMenu(menu)
+        tray.show()
+
+        # Deferred pipeline start
+        QTimer.singleShot(500, on_start)
+
+        # Store callbacks for main() signal setup
+        self._on_quit = on_quit
+        self._on_start = on_start
+
 
 def main():
     """
@@ -1385,494 +1744,20 @@ def main():
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 sys.exit(0)
 
-    # === 6. 创建UI组件 ===
-    log_window = LogWindow()
-    log_handler = log_window.get_handler()
-    logging.getLogger().addHandler(log_handler)
-
-    # 设置面板（7个标签页）
-    panel = ControlPanel(config, saved_settings=saved)
-
-    # 字幕悬浮窗
-    overlay = SubtitleOverlay(config["subtitle"])
-    # 恢复上次位置
-    if saved:
-        ox = saved.get("overlay_x")
-        oy = saved.get("overlay_y")
-        ow = saved.get("overlay_w")
-        oh = saved.get("overlay_h")
-        if ox is not None and oy is not None:
-            # 检查位置是否在可见区域
-            if SubtitleWindow._is_pos_visible(ox, oy):
-                overlay.move(ox, oy)
-            else:
-                # 屏幕右下角
-                screen = QApplication.primaryScreen()
-                geo = screen.availableGeometry()
-                overlay.move(geo.right() - overlay.width() - 20, geo.bottom() - overlay.height() - 60)
-        if ow and oh:
-            overlay.resize(ow, oh)
-    overlay.show()
-
-    # OBS字幕窗口
-    subwin_cfg = (saved or {}).get("subtitle_mode")
-    subwin = SubtitleWindow(subwin_cfg)
-    subwin_was_enabled = (subwin_cfg or {}).get("enabled", False)
-
-    # === 7. 创建核心应用并关联UI ===
+    # === 6. 创建核心应用并初始化UI ===
     live_trans = LiveTranslateApp(config)
-    live_trans.set_overlay(overlay)
-    live_trans.set_subtitle_window(subwin)
-    live_trans.set_panel(panel)
+    live_trans.init_ui(config, saved)
 
-    # === 8. 延迟初始化（UI先显示，模型后加载） ===
-    def _deferred_init():
-        """在UI显示后应用所有设置，加载模型"""
-        panel._apply_settings()
-        models = panel.get_settings().get("models", [])
-        active_idx = panel.get_settings().get("active_model", 0)
-        overlay.set_models(models, active_idx)
-        target = panel.get_settings().get("target_language", "zh")
-        overlay.set_target_language(target)
-        asr_lang = panel.get_settings().get("asr_language", "auto")
-        overlay.set_source_language(asr_lang)
-        style = panel.get_settings().get("style")
-        if style:
-            overlay.apply_style(style)
-        active_model = panel.get_active_model()
-        if active_model:
-            live_trans._on_model_changed(active_model)
+    # === 7. 初始化托盘菜单并关联信号 ===
+    live_trans.init_tray(_app_icon, app)
 
-    QTimer.singleShot(100, _deferred_init)
-
-    # === 9. 创建系统托盘 ===
-    tray = QSystemTrayIcon()
-    tray.setToolTip(t("tray_tooltip"))
-    tray.setIcon(_app_icon)
-
-    menu = QMenu()
-
-    # --- 暂停/恢复 ---
-    pause_action = QAction(t("tray_pause"))
-    _is_running = [True]  # 用列表包装以在闭包中修改
-
-    def on_start():
-        """启动管线"""
-        try:
-            live_trans.start()
-            overlay.set_running(True)
-            _is_running[0] = True
-            pause_action.setText(t("tray_pause"))
-        except Exception as e:
-            log.error(f"Start error: {e}", exc_info=True)
-
-    def on_pause():
-        """暂停管线"""
-        live_trans.pause()
-        overlay.set_running(False)
-        _is_running[0] = False
-        pause_action.setText(t("tray_resume"))
-
-    def on_resume():
-        """恢复管线"""
-        live_trans.resume()
-        overlay.set_running(True)
-        _is_running[0] = True
-        pause_action.setText(t("tray_pause"))
-
-    def on_toggle_pause():
-        """切换暂停/恢复"""
-        if _is_running[0]:
-            on_pause()
-        else:
-            on_resume()
-
-    pause_action.triggered.connect(on_toggle_pause)
-    menu.addAction(pause_action)
-    menu.addSeparator()
-
-    # --- 显示/隐藏字幕窗口 ---
-    overlay_toggle_action = QAction(t("tray_hide_overlay"))
-
-    _hide_notified = [False]
-
-    def on_toggle_overlay():
-        """切换字幕悬浮窗显示/隐藏"""
-        if overlay.isVisible():
-            overlay.hide()
-            overlay_toggle_action.setText(t("tray_show_overlay"))
-            # 首次隐藏时提示用户
-            if not _hide_notified[0]:
-                _hide_notified[0] = True
-                tray.showMessage(
-                    "LiveTranslate",
-                    t("hide_tray_hint"),
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3000,
-                )
-        else:
-            overlay.show()
-            overlay.raise_()
-            overlay_toggle_action.setText(t("tray_hide_overlay"))
-
-    overlay_toggle_action.triggered.connect(on_toggle_overlay)
-    menu.addAction(overlay_toggle_action)
-
-    # --- 字幕窗口切换（OBS用）---
-    # 保存字幕悬浮窗位置
-    def _save_overlay_pos():
-        settings = panel.get_settings()
-        pos = overlay.pos()
-        size = overlay.size()
-        settings["overlay_x"] = pos.x()
-        settings["overlay_y"] = pos.y()
-        settings["overlay_w"] = size.width()
-        settings["overlay_h"] = size.height()
-        panel._current_settings.update({
-            "overlay_x": pos.x(), "overlay_y": pos.y(),
-            "overlay_w": size.width(), "overlay_h": size.height(),
-        })
-        _save_settings(settings)
-
-    overlay.position_changed.connect(_save_overlay_pos)
-
-    # OBS字幕窗口开关
-    subwin_toggle_action = QAction(t("subwin_show"), checkable=True)
-
-    # 保存字幕窗口状态
-    def _save_subwin_state():
-        settings = panel.get_settings()
-        sm = settings.get("subtitle_mode") or {}
-        sm["enabled"] = subwin.isVisible()
-        pos = subwin.pos()
-        sm["window_x"] = pos.x()
-        sm["window_y"] = pos.y()
-        settings["subtitle_mode"] = sm
-        panel._current_settings["subtitle_mode"] = sm
-        _save_settings(settings)
-
-    _subwin_notified = [False]
-
-    def on_toggle_subwin(checked):
-        """切换OBS字幕窗口显示"""
-        if checked:
-            subwin.show()
-            subwin.raise_()
-            # 首次显示时提示拖拽方法
-            if not _subwin_notified[0]:
-                _subwin_notified[0] = True
-                tray.showMessage(
-                    "LiveTranslate",
-                    t("subwin_drag_hint"),
-                    QSystemTrayIcon.MessageIcon.Information,
-                    3000,
-                )
-        else:
-            subwin.hide()
-        overlay.set_subtitle_checked(checked)
-        _save_subwin_state()
-
-    subwin_toggle_action.toggled.connect(on_toggle_subwin)
-    subwin.position_changed.connect(_save_subwin_state)
-
-    # 字幕窗口手动关闭时（如Alt+F4）同步状态
-    def _on_subwin_closed():
-        subwin_toggle_action.blockSignals(True)
-        subwin_toggle_action.setChecked(False)
-        subwin_toggle_action.blockSignals(False)
-        overlay.set_subtitle_checked(False)
-        _save_subwin_state()
-
-    subwin.window_closed.connect(_on_subwin_closed)
-
-    # 恢复字幕窗口可见性状态
-    if subwin_was_enabled:
-        subwin_toggle_action.setChecked(True)
-
-    menu.addAction(subwin_toggle_action)
-
-    # overlay上的字幕按钮 → 切换字幕窗口
-    def _on_overlay_subtitle_toggle():
-        subwin_toggle_action.setChecked(not subwin_toggle_action.isChecked())
-
-    overlay.subtitle_toggled.connect(_on_overlay_subtitle_toggle)
-
-    # 控制面板字幕设置变化 → 应用到字幕窗口
-    def _on_panel_subtitle_changed(s):
-        subwin.apply_settings(s)
-
-    panel.subtitle_settings_changed.connect(_on_panel_subtitle_changed)
-
-    # 重置所有窗口位置
-    def _on_reset_positions():
-        screen = QApplication.primaryScreen()
-        geo = screen.availableGeometry()
-        subwin.move(100, 100)
-        _save_subwin_state()
-        ow, oh = overlay.width(), overlay.height()
-        overlay.move(geo.right() - ow - 50, geo.bottom() - oh - 100)
-        _save_overlay_pos()
-
-    panel.reset_positions.connect(_on_reset_positions)
-
-    menu.addSeparator()
-
-    # --- 显示日志/设置面板 ---
-    log_action = QAction(t("tray_show_log"))
-    panel_action = QAction(t("tray_show_panel"))
-
-    def on_toggle_log():
-        """切换日志窗口显示"""
-        if log_window.isVisible():
-            log_window.hide()
-        else:
-            log_window.show()
-            log_window.raise_()
-
-    def on_toggle_panel():
-        """切换设置面板显示"""
-        if panel.isVisible():
-            panel.hide()
-        else:
-            panel.show()
-            panel.raise_()
-
-    log_action.triggered.connect(on_toggle_log)
-    panel_action.triggered.connect(on_toggle_panel)
-    menu.addAction(panel_action)
-    menu.addAction(log_action)
-    menu.addSeparator()
-
-    # --- Overlay子菜单（点击穿透、置顶、自动滚动、任务栏）---
-    overlay_menu = QMenu(t("tray_menu_overlay"))
-
-    ct_action = QAction(t("click_through"), checkable=True)  # 点击穿透
-    topmost_action = QAction(t("top_most"), checkable=True)   # 置顶
-    topmost_action.setChecked(True)
-    autoscroll_action = QAction(t("auto_scroll"), checkable=True)  # 自动滚动
-    autoscroll_action.setChecked(True)
-    taskbar_action = QAction(t("taskbar"), checkable=True)  # 任务栏显示
-
-    # 托盘 → overlay 同步
-    ct_action.toggled.connect(lambda v: overlay._handle._ct_check.setChecked(v))
-    topmost_action.toggled.connect(
-        lambda v: overlay._handle._topmost_check.setChecked(v)
-    )
-    autoscroll_action.toggled.connect(
-        lambda v: overlay._handle._auto_scroll.setChecked(v)
-    )
-    taskbar_action.toggled.connect(
-        lambda v: overlay._handle._taskbar_check.setChecked(v)
-    )
-
-    # overlay → 托盘 同步（用户点击overlay上的控件时更新托盘菜单）
-    overlay._handle.click_through_toggled.connect(lambda v: ct_action.setChecked(v))
-    overlay._handle.topmost_toggled.connect(lambda v: topmost_action.setChecked(v))
-    overlay._handle.auto_scroll_toggled.connect(
-        lambda v: autoscroll_action.setChecked(v)
-    )
-    overlay._handle.taskbar_toggled.connect(lambda v: taskbar_action.setChecked(v))
-
-    overlay_menu.addAction(ct_action)
-    overlay_menu.addAction(topmost_action)
-    overlay_menu.addAction(autoscroll_action)
-    overlay_menu.addAction(taskbar_action)
-    menu.addMenu(overlay_menu)
-
-    # --- 翻译模型子菜单 ---
-    model_menu = QMenu(t("tray_menu_model"))
-    model_action_group = QActionGroup(model_menu)
-    model_action_group.setExclusive(True)
-
-    # 每次显示菜单前重建（动态适应模型列表变化）
-    def _rebuild_model_menu():
-        for a in model_action_group.actions():
-            model_action_group.removeAction(a)
-        model_menu.clear()
-        settings = panel.get_settings()
-        models = settings.get("models", [])
-        active = settings.get("active_model", 0)
-        for i, m in enumerate(models):
-            name = m.get("name", m.get("model", "?"))
-            action = QAction(name, checkable=True)
-            if i == active:
-                action.setChecked(True)
-            model_action_group.addAction(action)
-            action.triggered.connect(lambda checked, idx=i: _on_tray_model_switch(idx))
-            model_menu.addAction(action)
-
-    def _on_tray_model_switch(index):
-        """托盘菜单切换翻译模型"""
-        models = panel.get_settings().get("models", [])
-        if 0 <= index < len(models):
-            from voicebridge.ui.control_panel import _save_settings
-
-            settings = panel.get_settings()
-            settings["active_model"] = index
-            panel._current_settings["active_model"] = index
-            _save_settings(settings)
-            panel._refresh_model_list()
-            live_trans._on_model_changed(models[index])
-            overlay.set_models(models, index)
-
-    def on_overlay_model_switch(index):
-        models = panel.get_settings().get("models", [])
-        if 0 <= index < len(models):
-            from voicebridge.ui.control_panel import _save_settings
-
-            settings = panel.get_settings()
-            settings["active_model"] = index
-            panel._current_settings["active_model"] = index
-            _save_settings(settings)
-            panel._refresh_model_list()
-            live_trans._on_model_changed(models[index])
-        _rebuild_model_menu()
-
-    model_menu.aboutToShow.connect(_rebuild_model_menu)
-    menu.addMenu(model_menu)
-
-    # --- 目标语言子菜单 ---
-    lang_menu = QMenu(t("tray_menu_target_lang"))
-    lang_action_group = QActionGroup(lang_menu)
-    lang_action_group.setExclusive(True)
-    _lang_actions = {}
-    lang_more_menu = QMenu(t("tray_more_langs"))
-
-    # 常用语言放主菜单，其他放"更多"子菜单
-    for code, native in LANGUAGES:
-        if code == "auto":
-            continue
-        action = QAction(f"{code} - {native}", checkable=True)
-        lang_action_group.addAction(action)
-        action.triggered.connect(lambda checked, lc=code: _on_tray_lang_switch(lc))
-        if code in COMMON_LANG_CODES:
-            lang_menu.addAction(action)
-        else:
-            lang_more_menu.addAction(action)
-        _lang_actions[code] = action
-
-    lang_menu.addMenu(lang_more_menu)
-
-    # 恢复当前选中状态
-    current_target = panel.get_settings().get("target_language", "zh")
-    if current_target in _lang_actions:
-        _lang_actions[current_target].setChecked(True)
-
-    def _on_tray_lang_switch(lang_code):
-        """托盘菜单切换目标语言"""
-        overlay.set_target_language(lang_code)
-        live_trans._on_target_language_changed(lang_code)
-        from voicebridge.ui.control_panel import _save_settings
-
-        settings = panel.get_settings()
-        settings["target_language"] = lang_code
-        panel._current_settings["target_language"] = lang_code
-        _save_settings(settings)
-
-    # overlay → 托盘 同步
-    def _on_overlay_lang_changed(lang_code):
-        if lang_code in _lang_actions:
-            _lang_actions[lang_code].setChecked(True)
-
-    overlay.target_language_changed.connect(_on_overlay_lang_changed)
-
-    menu.addMenu(lang_menu)
-
-    # --- ASR语言子菜单 ---
-    asr_lang_menu = QMenu(t("tray_menu_asr_lang"))
-    asr_lang_action_group = QActionGroup(asr_lang_menu)
-    asr_lang_action_group.setExclusive(True)
-    _asr_lang_actions = {}
-    asr_more_menu = QMenu(t("tray_more_langs"))
-
-    for code, native in LANGUAGES:
-        label = t("asr_lang_auto") if code == "auto" else native
-        action = QAction(f"{code} - {label}", checkable=True)
-        asr_lang_action_group.addAction(action)
-        action.triggered.connect(lambda checked, c=code: _on_tray_asr_lang(c))
-        if code in COMMON_LANG_CODES:
-            asr_lang_menu.addAction(action)
-        else:
-            asr_more_menu.addAction(action)
-        _asr_lang_actions[code] = action
-
-    asr_lang_menu.addMenu(asr_more_menu)
-
-    # 恢复当前选中状态
-    current_asr_lang = panel.get_settings().get("asr_language", "auto")
-    if current_asr_lang in _asr_lang_actions:
-        _asr_lang_actions[current_asr_lang].setChecked(True)
-
-    def _on_tray_asr_lang(code):
-        """托盘菜单切换ASR语言"""
-        from voicebridge.ui.control_panel import _save_settings
-
-        if live_trans._asr:
-            live_trans._asr.set_language(code)
-        settings = panel.get_settings()
-        settings["asr_language"] = code
-        panel._current_settings["asr_language"] = code
-        _save_settings(settings)
-        # 同步控制面板的ASR语言下拉框
-        idx = panel._asr_lang.findData(code)
-        if idx >= 0:
-            panel._asr_lang.blockSignals(True)
-            panel._asr_lang.setCurrentIndex(idx)
-            panel._asr_lang.blockSignals(False)
-
-    menu.addMenu(asr_lang_menu)
-    menu.addSeparator()
-
-    # --- 退出 ---
-    quit_action = QAction(t("quit"))
-
-    def on_quit():
-        """退出应用：停止管线，退出Qt事件循环"""
-        live_trans.stop()
-        app.quit()
-
-    quit_action.triggered.connect(on_quit)
-    menu.addAction(quit_action)
-
-    # --- 连接overlay信号 ---
-    # overlay上的按钮 → 对应操作
-    overlay.settings_requested.connect(on_toggle_panel)  # 设置按钮
-    overlay.target_language_changed.connect(live_trans._on_target_language_changed)  # 目标语言变化
-
-    # overlay源语言变化 → 同步到托盘 + ASR引擎
-    def _on_overlay_source_lang(code):
-        _on_tray_asr_lang(code)
-        overlay.set_source_language(code)
-
-    # 控制面板ASR语言变化 → 同步到overlay
-    def _on_panel_asr_lang_changed(_index):
-        code = panel._asr_lang.currentData() or "auto"
-        overlay.set_source_language(code)
-
-    overlay.source_language_changed.connect(_on_overlay_source_lang)
-    panel._asr_lang.currentIndexChanged.connect(_on_panel_asr_lang_changed)
-    overlay.model_switch_requested.connect(on_overlay_model_switch)  # 模型切换
-    overlay.start_requested.connect(on_resume)   # 开始
-    overlay.stop_requested.connect(on_pause)    # 暂停
-    overlay.hide_requested.connect(on_toggle_overlay)  # 隐藏
-    overlay.quit_requested.connect(on_quit)      # 退出
-
-    # === 10. 显示托盘 ===
-    tray.setContextMenu(menu)
-    tray.show()
-
-    # === 11. 延迟启动管线 ===
-    QTimer.singleShot(500, on_start)
-
-    # === 12. 信号处理 ===
-    # Ctrl+C 优雅退出
-    signal.signal(signal.SIGINT, lambda *_: on_quit())
-    # 保持事件循环运行（防止空闲退出）
+    # === 8. 信号处理 ===
+    signal.signal(signal.SIGINT, lambda *_: live_trans._on_quit())
     timer = QTimer()
     timer.timeout.connect(lambda: None)
     timer.start(200)
 
-    # === 13. 进入Qt事件循环 ===
+    # === 9. 进入Qt事件循环 ===
     sys.exit(app.exec())
 
 
